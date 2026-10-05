@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "若本库对您的研究有帮助，请按以下信息引用。"
+title: "vessel-identity: entity identity and invalidation semantics for multi-fidelity vascular models"
+abstract: >-
+  提供血管实体身份与失效传播的最小语义：身份由显式谱系承载（不由几何推断），
+  上游修订后的下游可复用性由谱系边类型作确定性判定、几何等价性作二次确认，并输出三值结论。
+type: software
+license: MIT
+repository-code: "https://github.com/xiaoquan1021/vessel-identity"
+keywords:
+  - vascular
+  - provenance
+  - reproducibility
+  - hemodynamics
+  - identity
+authors:
+  - family-names: "ocean"
+    given-names: "ocean"
+version: 0.1.0
+date-released: "2026-10-05"
