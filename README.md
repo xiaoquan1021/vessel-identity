@@ -28,6 +28,8 @@
 - **OpenLineage** 有最完整的列级血缘规范，但 [OpenLineage#4127](https://github.com/OpenLineage/OpenLineage/issues/4127) 显示：标识派生规则漏一处，血缘不是报错而是**静默丢边**。
 - **工作流引擎**（Snakemake / Nextflow）能回答"改了没有"，不能回答"改的是不是同一件事"；且未声明的依赖会导致静默陈旧复用。
 
+在公开的 Vascular Model Repository 上抽样审计 20 个主动脉病例的结果（边界条件靠顺序绑定、状态字段不携带信息、身份即名字）见 [`docs/motivation.md`](docs/motivation.md)。
+
 **血管树匹配文献**明确拒绝了靠分叉点/几何恢复身份（假分叉、断裂中心线、同一批 50 例中出现 28 种标签排布）。这直接决定了本库的设计立场。
 
 ## 设计立场
