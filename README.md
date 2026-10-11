@@ -92,6 +92,7 @@ thresholds = EquivalenceThresholds(
 result = invalidate(
     ArtifactDependency("wss_map", depends_on=frozenset({r0})),
     delta_edges=[edge_for_r0_to_r1],
+    current_revisions={r1},     # 必填：当前全部修订（用于发现孤立依赖）
     equivalence_pairs={(r0, r1): (geom_before, geom_after)},
     thresholds=thresholds,
 )
@@ -100,6 +101,7 @@ print(result.validity)          # INVALID | REUSABLE | STALE_UNCERTAIN
 print(result.may_serve_as_current)
 for reason in result.reasons:
     print(reason)               # 理由可回放
+print(result.rebased_dependencies)  # ((r0, r1),)：复用时把依赖改钉到新修订
 ```
 
 ## 核心概念
@@ -119,6 +121,10 @@ for reason in result.reasons:
 ```
 上游修订 Δ
    │
+   ├─ 第 0 步：依赖是否还活着（确定性）
+   │     依赖不在当前修订集合、且 Δ 中没有以它为父的边 → INVALID（孤立依赖：
+   │     被无归属的新实体取代，或已删除）
+   │
    ├─ 第 1 步：看谱系边的类型（确定性）
    │     SPLIT / MERGE / DELETE_PART / UNATTRIBUTED  → INVALID（立即，无需度量）
    │     REFINE / REPLACE_EQUIVALENT / RENUMBER      → 进入第 2 步
@@ -127,7 +133,12 @@ for reason in result.reasons:
          EQUIVALENT      → REUSABLE
          NON_EQUIVALENT  → INVALID
          UNCERTAIN       → STALE_UNCERTAIN（交人工裁决，禁止当 current）
+         （后继修订本身也不在当前集合——Δ 含多步修订——同样 STALE_UNCERTAIN）
 ```
+
+**为什么 `current_revisions` 是必填的**：完全无法归属的 `UNATTRIBUTED` 边不带父修订，删除也可能不留边；只看 Δ 中的边，就发现不了「依赖已经没了」。如果允许缺省，静默错误复用就成了默认行为（0.1.0 的缺陷，见 issue #1）。
+
+**改钉依赖**：判 `REUSABLE` 且经等价性确认时，`rebased_dependencies` 给出（旧修订, 新修订）对。调用方应把产物的依赖改钉到新修订；不改钉，下一次判定会把旧修订当孤立依赖而判 `INVALID`——这是有意的保守方向（多余重算，而不是错误复用）。
 
 **为什么不能反过来**：等价性是度量，会失败、会有灰区；身份与拓扑语义是声明，应当是确定的。让度量推翻声明，等于把不可靠的推断升级成事实。
 
@@ -141,11 +152,14 @@ for reason in result.reasons:
 
 ## 阈值标定（尚未完成）
 
-等价性阈值需要在标定集上确定。计划的方法：
+**等价性阈值不是几何的内禀属性。** 「两条几何等价」只有相对于某个下游模型、某个关心的量（QoI）和该量的容差才有意义：同一对几何，对 0D 平均压力可能等价，对 3D 壁面切应力可能不等价。
 
-1. 取同一例 CTA 的多次处理结果（不同分割版本、不同中心线参数），构成"已知同源"几何对；
-2. 对同一几何施加受控扰动（1% / 5% / 10% 半径变化、亚像素位移、重采样），构成"已知异源"对；
-3. 在标定集上取判定器的工作点，报告判据曲线与混淆矩阵。
+下游平台的首次实测说明了这一点：把「结果是否改变」定在数值噪声级（相对 1e-6）时，任何真实的几何变化都会改变结果，任何非零阈值都会造成错误复用。因此标定必须：
+
+1. 先定下游模型类、QoI 与容差 ε（例如以参考测量的可重复性为锚）；
+2. 对真实几何施加多族受控扰动（均匀/局部半径变化、中心线位移、等面积变形），测下游 QoI 的变化；
+3. 在训练集上取阈值，在留出集上报告错误复用与多余重算；
+4. 标定结果通过 `calibration_ref` 指向，其中写明适用范围（模型类、QoI、ε）。
 
 标定完成前，本库的等价性判定只能用于**保守方向**（倾向重算），不得用于声称"无需重算"。
 
@@ -155,7 +169,7 @@ for reason in result.reasons:
 python -m pytest -q
 ```
 
-测试覆盖：身份持久性、append-only 谱系、拆分/合并谱系、诚实性约束（不得猜测、不得由推断断言同一性）、等价性三值输出、失效传播的判定顺序、以及边界输入拒绝。
+测试覆盖：身份持久性、append-only 谱系、拆分/合并谱系、诚实性约束（不得猜测、不得由推断断言同一性）、等价性三值输出、失效传播的判定顺序（含孤立依赖与改钉）、以及边界输入拒绝。
 
 ## 许可
 
