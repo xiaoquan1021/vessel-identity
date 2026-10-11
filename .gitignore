@@ -11,5 +11,3 @@ build/
 .mypy_cache/
 .ruff_cache/
 
-# 待补：CI 工作流（需要 GitHub token 具备 workflow 权限范围）
-.github/workflows/
