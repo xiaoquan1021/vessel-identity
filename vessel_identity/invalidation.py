@@ -2,7 +2,9 @@
 
 判定顺序（这是本模块最重要的设计决定）：
 
-  1. **先看谱系边的类型**（确定性判定）——拓扑是否改变由声明决定，不由度量决定；
+  0. **先看依赖是否还活着**（确定性判定）——依赖的修订已不是当前修订、
+     本次谱系里又找不到它的后继，就是孤立依赖，必须重算；
+  1. **再看谱系边的类型**（确定性判定）——拓扑是否改变由声明决定，不由度量决定；
   2. **再用等价性做二次确认**（度量判定）——仅在需要时才计算，且不能推翻第 1 步结论；
   3. 判不了就输出 ``STALE_UNCERTAIN``，禁止静默当作 current。
 
@@ -51,6 +53,12 @@ class InvalidationResult:
     validity: Validity
     reasons: tuple[str, ...]
     equivalence_verdicts: tuple[EquivalenceVerdict, ...] = ()
+    rebased_dependencies: tuple[tuple[RevisionId, RevisionId], ...] = ()
+    """REUSABLE 且经等价性确认时的（旧修订, 新修订）对。
+
+    调用方应据此把产物的依赖改钉到新修订；不改钉的话，下一次判定会把旧修订
+    当作孤立依赖而保守地判 INVALID（多余重算，而不是错误复用）。
+    """
 
     @property
     def may_serve_as_current(self) -> bool:
@@ -58,10 +66,28 @@ class InvalidationResult:
         return self.validity is Validity.REUSABLE
 
 
+def _as_current_set(current_revisions: Iterable[RevisionId]) -> frozenset[RevisionId]:
+    if current_revisions is None:
+        raise TypeError(
+            "current_revisions 不得为 None：不知道哪些修订是当前的，就无法发现孤立依赖"
+            "（依赖被无归属重导入取代或被删除）——这正是静默错误复用的来源。"
+            "请传入当前全部修订的集合（可以为空集合）"
+        )
+    current = frozenset(current_revisions)
+    wrong = [x for x in current if not isinstance(x, RevisionId)]
+    if wrong:
+        raise TypeError(
+            f"current_revisions 只能包含 RevisionId，实际含 {type(wrong[0]).__name__}"
+            "（常见错误：传入了 EntityId）"
+        )
+    return current
+
+
 def invalidate(
     artifact: ArtifactDependency,
     delta_edges: Iterable[LineageEdge],
     *,
+    current_revisions: Iterable[RevisionId],
     equivalence_pairs: Mapping[tuple[RevisionId, RevisionId], tuple[BranchGeometry, BranchGeometry]]
     | None = None,
     thresholds: EquivalenceThresholds | None = None,
@@ -70,13 +96,35 @@ def invalidate(
 
     artifact:            下游产物的依赖声明
     delta_edges:         本次产生的谱系边（上游改动）
+    current_revisions:   当前全部修订的集合（必填；用于发现孤立依赖）
     equivalence_pairs:   需要做等价性验证的（旧修订, 新修订）→ 几何对
     thresholds:          等价性阈值（仅在需要等价性验证时使用）
     """
+    current = _as_current_set(current_revisions)
+    edges = list(delta_edges)
     reasons: list[str] = []
     verdicts: list[EquivalenceVerdict] = []
 
-    relevant = [e for e in delta_edges if e.parent_revision in artifact.depends_on]
+    # 第 0 步：孤立依赖（确定性判定）。完全无法归属的 UNATTRIBUTED 边不带父修订，
+    # 删除也可能不留边——两者都只能从「依赖已不是当前修订、且找不到后继」看出来。
+    has_successor = {e.parent_revision for e in edges if e.parent_revision is not None}
+    orphaned = sorted(
+        (r for r in artifact.depends_on if r not in current and r not in has_successor),
+        key=str,
+    )
+    if orphaned:
+        for r in orphaned:
+            reasons.append(
+                f"依赖 {r} 已不是当前修订，且本次谱系中没有以它为父的边"
+                "（被无归属的新实体取代，或已删除）→ 孤立依赖，下游必须重算"
+            )
+        return InvalidationResult(
+            artifact_id=artifact.artifact_id,
+            validity=Validity.INVALID,
+            reasons=tuple(reasons),
+        )
+
+    relevant = [e for e in edges if e.parent_revision in artifact.depends_on]
     if not relevant:
         return InvalidationResult(
             artifact_id=artifact.artifact_id,
@@ -180,11 +228,28 @@ def invalidate(
             )
         reasons.append(f"{old_rev} → {new_rev} 等价性确认通过：{verdict.reason}")
 
+    # 后继本身也不是当前修订：本次谱系含多步修订（如 r0→r1→r2），
+    # 只确认了第一步，不能声称对当前修订可复用。
+    stale_successors = sorted({new for _, new in needs_equivalence if new not in current}, key=str)
+    if stale_successors:
+        for r in stale_successors:
+            reasons.append(
+                f"后继修订 {r} 也不是当前修订（本次谱系含多步修订）→ 无法判定，"
+                "请逐步判定并改钉依赖，或提供直达当前修订的几何对"
+            )
+        return InvalidationResult(
+            artifact_id=artifact.artifact_id,
+            validity=Validity.STALE_UNCERTAIN,
+            reasons=tuple(reasons),
+            equivalence_verdicts=tuple(verdicts),
+        )
+
     return InvalidationResult(
         artifact_id=artifact.artifact_id,
         validity=Validity.REUSABLE,
         reasons=tuple(reasons),
         equivalence_verdicts=tuple(verdicts),
+        rebased_dependencies=tuple(needs_equivalence),
     )
 
 

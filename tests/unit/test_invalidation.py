@@ -62,6 +62,7 @@ def test_untouched_artifact_stays_reusable():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({other})),
         delta_edges=[edge],
+        current_revisions={other, _r1},
         equivalence_pairs=None,
         thresholds=None,
     )
@@ -88,6 +89,7 @@ def test_topology_change_invalidates_without_any_metrics(kind):
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs=None,     # 故意不给：拓扑改变不需要度量
         thresholds=None,
     )
@@ -96,8 +98,12 @@ def test_topology_change_invalidates_without_any_metrics(kind):
     assert any(kind.value in r for r in result.reasons)
 
 
-def test_unattributed_new_entity_invalidates():
-    """完全无法归属的新实体：下游必须重算（不能默认当成同一实体）。"""
+def test_unattributed_reimport_orphans_dependency_and_invalidates():
+    """完全无法归属的新实体（重导入）：依赖旧修订的产物必须重算（GAP-VI-1，issue #1）。
+
+    UNATTRIBUTED 边不带父修订，第 1 步看不到它；必须由第 0 步「孤立依赖」发现：
+    r0 已不是当前修订，且本次谱系中没有以 r0 为父的边。
+    """
     e = EntityId.new()
     store = LineageStore()
     r0 = RevisionId.new()
@@ -105,10 +111,83 @@ def test_unattributed_new_entity_invalidates():
                              DeclarationSource.ALGORITHM, T0, "tester", notes="初始"))
     new_entity, r1 = EntityId.new(), RevisionId.new()
     edge = LineageEdge(None, None, new_entity, r1, OperationKind.UNATTRIBUTED,
-                       DeclarationSource.HUMAN, T1, "tester", notes="换了另一版分割")
-    # 注意：这条边的 parent_revision 为 None，不会匹配依赖 r0，
-    # 因此需要通过一个显式指向 r0 的场景来测——见下一个测试。
-    assert edge.parent_revision is None
+                       DeclarationSource.IMPORT, T1, "tester", notes="换了另一版分割，无法声明对应关系")
+    store.append(edge)
+    result = invalidate(
+        ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+        delta_edges=[edge],
+        current_revisions={r1},
+    )
+    assert result.validity is Validity.INVALID, result.reasons
+    assert not result.may_serve_as_current
+    joined = " ".join(result.reasons)
+    assert str(r0) in joined and "孤立依赖" in joined
+
+
+def test_orphaned_dependency_cannot_be_rescued_by_equivalence():
+    """孤立依赖是确定性判定：给出「看起来完全相同」的几何对也不能救回。"""
+    _, _, r0, r1, _edge = _chain()
+    result = invalidate(
+        ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+        delta_edges=[],                       # 没有以 r0 为父的边
+        current_revisions={r1},
+        equivalence_pairs={(r0, r1): (_line(), _line())},
+        thresholds=THRESHOLDS,
+    )
+    assert result.validity is Validity.INVALID
+
+
+def test_deleted_dependency_without_any_edge_invalidates():
+    """删除后没有留下任何边：依赖不在当前集合 → INVALID，而不是「未触及」。"""
+    _, _, r0, _r1, _edge = _chain()
+    result = invalidate(
+        ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+        delta_edges=[],
+        current_revisions=set(),
+    )
+    assert result.validity is Validity.INVALID
+
+
+def test_current_dependency_without_delta_is_reusable_and_not_rebased():
+    _, _, r0, _r1, _edge = _chain()
+    result = invalidate(
+        ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+        delta_edges=[],
+        current_revisions={r0},
+    )
+    assert result.validity is Validity.REUSABLE
+    assert result.rebased_dependencies == ()
+
+
+@pytest.mark.parametrize("bad", [None, "not-a-set-of-revisions"])
+def test_current_revisions_must_be_a_set_of_revision_ids(bad):
+    _, _, r0, _r1, _edge = _chain()
+    with pytest.raises(TypeError):
+        invalidate(
+            ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+            delta_edges=[],
+            current_revisions=bad,
+        )
+
+
+def test_current_revisions_rejects_entity_ids():
+    """常见错误：把 EntityId 当成修订传进来——必须拒绝，否则所有依赖都会被判孤立。"""
+    e, _, r0, _r1, _edge = _chain()
+    with pytest.raises(TypeError, match="EntityId"):
+        invalidate(
+            ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+            delta_edges=[],
+            current_revisions={e},
+        )
+
+
+def test_current_revisions_is_required():
+    _, _, r0, _r1, edge = _chain()
+    with pytest.raises(TypeError):
+        invalidate(  # type: ignore[call-arg]
+            ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+            delta_edges=[edge],
+        )
 
 
 # ------------------------------------------- REFINE：需要度量，三值各就其位
@@ -118,6 +197,7 @@ def test_refine_with_equivalent_geometry_is_reusable():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs={(r0, r1): (_line(n=21), _line(n=37))},   # 采样不同，几何相同
         thresholds=THRESHOLDS,
     )
@@ -131,6 +211,7 @@ def test_refine_with_different_geometry_invalidates():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs={(r0, r1): (_line(length=100.0), _line(length=140.0))},
         thresholds=THRESHOLDS,
     )
@@ -143,6 +224,7 @@ def test_refine_in_ambiguous_zone_yields_stale_uncertain():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs={(r0, r1): (_line(length=100.0), _line(length=101.9))},
         thresholds=THRESHOLDS,
     )
@@ -156,6 +238,7 @@ def test_missing_geometry_pair_yields_uncertain_not_reusable():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs=None,
         thresholds=THRESHOLDS,
     )
@@ -168,6 +251,7 @@ def test_missing_thresholds_yields_uncertain():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs={(r0, r1): (_line(), _line())},
         thresholds=None,
     )
@@ -185,6 +269,7 @@ def test_byte_level_change_without_geometry_change_is_reusable():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs={(r0, r1): (_line(), _line())},
         thresholds=THRESHOLDS,
     )
@@ -208,6 +293,7 @@ def test_topology_change_cannot_be_rescued_by_geometry_metrics():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[split_edge],
+        current_revisions={r1},
         # 故意给出"看起来完全相同"的几何，模拟度量误判
         equivalence_pairs={(r0, r1): (_line(), _line())},
         thresholds=THRESHOLDS,
@@ -228,7 +314,8 @@ def test_renumber_requires_equivalence_evidence():
     # 无几何对 → 不确定
     r_no_geom = invalidate(
         ArtifactDependency("wss", depends_on=frozenset({r0})),
-        delta_edges=[edge], equivalence_pairs=None, thresholds=THRESHOLDS,
+        delta_edges=[edge], current_revisions={r1},
+        equivalence_pairs=None, thresholds=THRESHOLDS,
     )
     assert r_no_geom.validity is Validity.STALE_UNCERTAIN
 
@@ -236,10 +323,75 @@ def test_renumber_requires_equivalence_evidence():
     r_geom = invalidate(
         ArtifactDependency("wss", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs={(r0, r1): (_line(), _line())},
         thresholds=THRESHOLDS,
     )
     assert r_geom.validity is Validity.REUSABLE
+
+
+# ------------------------------------------------------ 改钉依赖（0.2）
+def test_reusable_refine_reports_rebased_dependency():
+    _, _, r0, r1, edge = _chain()
+    result = invalidate(
+        ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+        delta_edges=[edge],
+        current_revisions={r1},
+        equivalence_pairs={(r0, r1): (_line(), _line())},
+        thresholds=THRESHOLDS,
+    )
+    assert result.validity is Validity.REUSABLE
+    assert result.rebased_dependencies == ((r0, r1),)
+
+
+def test_unrebased_dependency_is_conservatively_invalid_next_time():
+    """上次判 REUSABLE 后调用方没有改钉依赖：下一次判定把旧修订当孤立依赖 → INVALID。
+
+    这是有意的保守方向（多余重算，而不是错误复用）；改钉后则保持 REUSABLE。
+    """
+    _, _, r0, r1, edge = _chain()
+    first = invalidate(
+        ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+        delta_edges=[edge],
+        current_revisions={r1},
+        equivalence_pairs={(r0, r1): (_line(), _line())},
+        thresholds=THRESHOLDS,
+    )
+    assert first.validity is Validity.REUSABLE
+
+    stale = invalidate(
+        ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+        delta_edges=[],
+        current_revisions={r1},
+    )
+    assert stale.validity is Validity.INVALID
+
+    rebased = frozenset(new for _, new in first.rebased_dependencies)
+    fresh = invalidate(
+        ArtifactDependency("wss_map", depends_on=rebased),
+        delta_edges=[],
+        current_revisions={r1},
+    )
+    assert fresh.validity is Validity.REUSABLE
+
+
+def test_multistep_delta_with_noncurrent_successor_is_stale_uncertain():
+    """r0→r1→r2 在同一次 delta 中，只确认了 r0→r1：不能声称对当前修订 r2 可复用。"""
+    e, store, r0, r1, edge = _chain()
+    r2 = RevisionId.new()
+    edge2 = LineageEdge(e, r1, e, r2, OperationKind.REFINE,
+                        DeclarationSource.ALGORITHM, T1, "tester")
+    store.append(edge2)
+    result = invalidate(
+        ArtifactDependency("wss_map", depends_on=frozenset({r0})),
+        delta_edges=[edge, edge2],
+        current_revisions={r2},
+        equivalence_pairs={(r0, r1): (_line(), _line())},
+        thresholds=THRESHOLDS,
+    )
+    assert result.validity is Validity.STALE_UNCERTAIN, result.reasons
+    assert not result.may_serve_as_current
+    assert result.rebased_dependencies == ()
 
 
 # ------------------------------------------------------ 下游闭包（辅助查询）
@@ -269,6 +421,7 @@ def test_reasons_are_replayable_and_mention_the_revision():
     result = invalidate(
         ArtifactDependency("wss_map", depends_on=frozenset({r0})),
         delta_edges=[edge],
+        current_revisions={r1},
         equivalence_pairs={(r0, r1): (_line(length=100.0), _line(length=140.0))},
         thresholds=THRESHOLDS,
     )
